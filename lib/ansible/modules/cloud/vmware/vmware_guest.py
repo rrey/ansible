@@ -151,6 +151,8 @@ options:
     - ' - C(cpu_reservation) (integer): The amount of CPU resource that is guaranteed available to the virtual machine.
           Unit is MHz. version_added: 2.5'
     - ' - C(version) (integer): The Virtual machine hardware versions. Default is 10 (ESXi 5.5 and onwards).
+          If value specified as C(latest), version is set to the most current virtual hardware supported on the host.
+          C(latest) is added in version 2.10.
           Please check VMware documentation for correct virtual machine hardware version.
           Incorrect hardware version may lead to failure in deployment. If hardware version is already equal to the given
           version then no action is taken. version_added: 2.6'
@@ -263,6 +265,12 @@ options:
        This is specifically the case for removing a powered on the virtual machine when C(state) is set to C(absent).'
     default: 'no'
     type: bool
+  delete_from_inventory:
+    description:
+    - Whether to delete Virtual machine from inventory or delete from disk.
+    default: False
+    type: bool
+    version_added: '2.10'
   datacenter:
     description:
     - Destination datacenter for the deploy operation.
@@ -532,6 +540,17 @@ EXAMPLES = r'''
     password: "{{ vcenter_password }}"
     validate_certs: no
     uuid: "{{ vm_uuid }}"
+    state: absent
+  delegate_to: localhost
+
+- name: Remove a virtual machine from inventory
+  vmware_guest:
+    hostname: "{{ vcenter_hostname }}"
+    username: "{{ vcenter_username }}"
+    password: "{{ vcenter_password }}"
+    validate_certs: no
+    name: vm_name
+    delete_from_inventory: True
     state: absent
   delegate_to: localhost
 
@@ -885,12 +904,22 @@ class PyVmomiHelper(PyVmomi):
     def gather_facts(self, vm):
         return gather_vm_facts(self.content, vm)
 
-    def remove_vm(self, vm):
+    def remove_vm(self, vm, delete_from_inventory=False):
         # https://www.vmware.com/support/developer/converter-sdk/conv60_apireference/vim.ManagedEntity.html#destroy
         if vm.summary.runtime.powerState.lower() == 'poweredon':
             self.module.fail_json(msg="Virtual machine %s found in 'powered on' state, "
                                       "please use 'force' parameter to remove or poweroff VM "
                                       "and try removing VM again." % vm.name)
+        # Delete VM from Inventory
+        if delete_from_inventory:
+            try:
+                vm.UnregisterVM()
+            except (vim.fault.TaskInProgress,
+                    vmodl.RuntimeFault) as e:
+                return {'changed': self.change_applied, 'failed': True, 'msg': e.msg, 'op': 'UnregisterVM'}
+            self.change_applied = True
+            return {'changed': self.change_applied, 'failed': False}
+        # Delete VM from Disk
         task = vm.Destroy()
         self.wait_for_task(task)
         if task.info.state == 'error':
@@ -1246,42 +1275,55 @@ class PyVmomiHelper(PyVmomi):
             if 'version' in self.params['hardware']:
                 hw_version_check_failed = False
                 temp_version = self.params['hardware'].get('version', 10)
-                try:
-                    temp_version = int(temp_version)
-                except ValueError:
-                    hw_version_check_failed = True
+                if temp_version.lower() == 'latest':
+                    # Check is to make sure vm_obj is not of type template
+                    if vm_obj and not vm_obj.config.template:
+                        try:
+                            task = vm_obj.UpgradeVM_Task()
+                            self.wait_for_task(task)
+                            if task.info.state == 'error':
+                                return {'changed': self.change_applied, 'failed': True, 'msg': task.info.error.msg, 'op': 'upgrade'}
+                        except vim.fault.AlreadyUpgraded:
+                            # Don't fail if VM is already upgraded.
+                            pass
+                else:
+                    try:
+                        temp_version = int(temp_version)
+                    except ValueError:
+                        hw_version_check_failed = True
 
-                if temp_version not in range(3, 15):
-                    hw_version_check_failed = True
+                    if temp_version not in range(3, 16):
+                        hw_version_check_failed = True
 
-                if hw_version_check_failed:
-                    self.module.fail_json(msg="Failed to set hardware.version '%s' value as valid"
+                    if hw_version_check_failed:
+                        self.module.fail_json(msg="Failed to set hardware.version '%s' value as valid"
                                               " values range from 3 (ESX 2.x) to 14 (ESXi 6.5 and greater)." % temp_version)
-                # Hardware version is denoted as "vmx-10"
-                version = "vmx-%02d" % temp_version
-                self.configspec.version = version
-                if vm_obj is None or self.configspec.version != vm_obj.config.version:
-                    self.change_detected = True
-                if vm_obj is not None:
-                    # VM exists and we need to update the hardware version
-                    current_version = vm_obj.config.version
-                    # current_version = "vmx-10"
-                    version_digit = int(current_version.split("-", 1)[-1])
-                    if temp_version < version_digit:
-                        self.module.fail_json(msg="Current hardware version '%d' which is greater than the specified"
+                    # Hardware version is denoted as "vmx-10"
+                    version = "vmx-%02d" % temp_version
+                    self.configspec.version = version
+                    if vm_obj is None or self.configspec.version != vm_obj.config.version:
+                        self.change_detected = True
+                    # Check is to make sure vm_obj is not of type template
+                    if vm_obj and not vm_obj.config.template:
+                        # VM exists and we need to update the hardware version
+                        current_version = vm_obj.config.version
+                        # current_version = "vmx-10"
+                        version_digit = int(current_version.split("-", 1)[-1])
+                        if temp_version < version_digit:
+                            self.module.fail_json(msg="Current hardware version '%d' which is greater than the specified"
                                                   " version '%d'. Downgrading hardware version is"
                                                   " not supported. Please specify version greater"
                                                   " than the current version." % (version_digit,
                                                                                   temp_version))
-                    new_version = "vmx-%02d" % temp_version
-                    try:
-                        task = vm_obj.UpgradeVM_Task(new_version)
-                        self.wait_for_task(task)
-                        if task.info.state == 'error':
-                            return {'changed': self.change_applied, 'failed': True, 'msg': task.info.error.msg, 'op': 'upgrade'}
-                    except vim.fault.AlreadyUpgraded:
-                        # Don't fail if VM is already upgraded.
-                        pass
+                        new_version = "vmx-%02d" % temp_version
+                        try:
+                            task = vm_obj.UpgradeVM_Task(new_version)
+                            self.wait_for_task(task)
+                            if task.info.state == 'error':
+                                return {'changed': self.change_applied, 'failed': True, 'msg': task.info.error.msg, 'op': 'upgrade'}
+                        except vim.fault.AlreadyUpgraded:
+                            # Don't fail if VM is already upgraded.
+                            pass
 
             if 'virt_based_security' in self.params['hardware']:
                 host_version = self.select_host().summary.config.product.version
@@ -2733,6 +2775,7 @@ def main():
         vapp_properties=dict(type='list', default=[]),
         datastore=dict(type='str'),
         convert=dict(type='str', choices=['thin', 'thick', 'eagerzeroedthick']),
+        delete_from_inventory=dict(type='bool', default=False),
     )
 
     module = AnsibleModule(argument_spec=argument_spec,
@@ -2767,7 +2810,7 @@ def main():
             if module.params['force']:
                 # has to be poweredoff first
                 set_vm_power_state(pyv.content, vm, 'poweredoff', module.params['force'])
-            result = pyv.remove_vm(vm)
+            result = pyv.remove_vm(vm, module.params['delete_from_inventory'])
         elif module.params['state'] == 'present':
             if module.check_mode:
                 result.update(

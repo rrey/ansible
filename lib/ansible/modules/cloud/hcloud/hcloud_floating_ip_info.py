@@ -61,6 +61,12 @@ hcloud_floating_ip_info:
             returned: always
             type: int
             sample: 1937415
+        name:
+            description: Name of the Floating IP
+            returned: Always
+            type: str
+            sample: my-floating-ip
+            version_added: "2.10"
         description:
             description: Description of the Floating IP
             returned: always
@@ -117,6 +123,7 @@ class AnsibleHcloudFloatingIPInfo(Hcloud):
                     server_name = floating_ip.server.name
                 tmp.append({
                     "id": to_native(floating_ip.id),
+                    "name": to_native(floating_ip.name),
                     "description": to_native(floating_ip.description),
                     "ip": to_native(floating_ip.ip),
                     "type": to_native(floating_ip.type),
